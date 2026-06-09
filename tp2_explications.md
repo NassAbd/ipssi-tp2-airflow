@@ -1,104 +1,109 @@
-# TP2A Airflow : Préparation d'une Ingestion API Météo Multi-Villes
+# TP2B Airflow : Ingestion Complète API → Transformation → PostgreSQL
 
-## 1. Rôle de chaque tâche et structure du DAG
+## 1. Rôle des tâches et Structure du DAG (10 tâches)
 
-Le DAG `tp2_simple_dag` traite en parallèle **3 villes** (Paris, Lyon, Marseille) pour séparer strictement l'extraction de la transformation :
+Le DAG `tp2_simple_dag` a été étendu pour implémenter un flux ETL complet sur **3 villes** en parallèle, suivi d'une tâche d'audit :
 
 ```mermaid
 graph TD
     subgraph Paris
-        extract_paris[extract_weather_paris] --> validate_paris[validate_weather_paris]
+        extract_paris[extract_weather_paris] --> validate_paris[validate_weather_paris] --> load_paris[load_weather_paris]
     end
     subgraph Lyon
-        extract_lyon[extract_weather_lyon] --> validate_lyon[validate_weather_lyon]
+        extract_lyon[extract_weather_lyon] --> validate_lyon[validate_weather_lyon] --> load_lyon[load_weather_lyon]
     end
     subgraph Marseille
-        extract_marseille[extract_weather_marseille] --> validate_marseille[validate_weather_marseille]
+        extract_marseille[extract_weather_marseille] --> validate_marseille[validate_weather_marseille] --> load_marseille[load_weather_marseille]
     end
 
-    validate_paris --> save_weather_report[save_weather_report]
-    validate_lyon --> save_weather_report
-    validate_marseille --> save_weather_report
+    load_paris --> log_ingestion_run[log_ingestion_run]
+    load_lyon --> log_ingestion_run
+    load_marseille --> log_ingestion_run
 ```
 
-### Description des Tâches :
-1. **`extract_weather_[ville]`** (Tâche d'extraction brute) :
-   * **Rôle** : Interroge l'API Open-Meteo pour récupérer les données en temps réel d'une ville spécifique via ses coordonnées géographiques.
-   * **Données en sortie** : Retourne la réponse JSON brute de l'API (transmise par XCom).
-2. **`validate_weather_[ville]`** (Tâche de transformation et validation) :
-   * **Rôle** : Récupère la réponse JSON brute, en extrait les champs d'intérêt, effectue le décodage métier, valide les contraintes via le modèle Pydantic `WeatherData` et génère un dictionnaire structuré prêt à l'ingestion.
-3. **`save_weather_report`** (Tâche de consolidation finale) :
-   * **Rôle** : Récupère les données validées et nettoyées des 3 villes via XCom et affiche un rapport météo consolidé et propre.
+### Description des rôles :
+1. **`extract_weather_[ville]` (Extract)** : Interroge l'API Open-Meteo pour récupérer le JSON brut de la ville. C'est ici que la tâche est marquée comme *SKIPPED* si la ville n'est pas demandée en paramètre.
+2. **`validate_weather_[ville]` (Transform)** : Reçoit le JSON brute, en extrait les indicateurs, décode les codes météo WMO, et valide les types et plages avec Pydantic (`WeatherData`).
+3. **`load_weather_[ville]` (Load)** : Insère la ligne nettoyée et validée dans la table Postgres `weather_measures` via le `PostgresHook`.
+4. **`log_ingestion_run` (Audit)** : Tâche finale exécutée systématiquement (`trigger_rule='all_done'`). Elle compile les villes correctement chargées, compte le nombre total de lignes insérées, et consigne ces métadonnées d'audit dans la table `ingestion_runs`.
 
 ---
 
-## 2. Modèle de données & Justifications métiers
+## 2. Script SQL d'initialisation (`init_db.sql`)
 
-### A. Distinction des données
-* **Données provenant directement de l'API (Données brutes)** :
-  * `temperature_2m` (float) : Température mesurée à 2 mètres du sol.
-  * `relative_humidity_2m` (int) : Humidité relative en pourcentage.
-  * `weather_code` (int) : Code numérique WMO caractérisant la météo.
-* **Données préparées pour le pipeline (Données enrichies)** :
-  * `city` (str) : Nom de la ville (ajouté à l'étape de validation à partir de la configuration).
-  * `conditions` (str) : Traduction textuelle humaine du code WMO (ex : code `3` -> `"Overcast"`, code `0` -> `"Clear sky"`).
-  * `timestamp` (datetime) : Date et heure ISO (en UTC) à laquelle la donnée a été validée et ingérée.
+Les tables SQL ont été créées sur l'instance PostgreSQL locale (port `54322`) avec le DDL suivant :
 
-### B. Justification des champs retenus (et des exclusions)
-Dans le but de **"ne pas tout garder sans justification"**, nous trions les données reçues de l'API :
-* **Champs Conservés (Besoin Métier)** :
-  * La température et l'humidité sont les indicateurs climatiques directs indispensables pour une analyse météo.
-  * Le code WMO converti en texte permet une lecture immédiate et simplifiée de l'état du ciel (pluie, soleil, nuageux).
-  * Le nom de la ville et le timestamp d'ingestion permettent de partitionner et d'indexer correctement nos données historiques.
-* **Champs Exclus (Sans valeur ajoutée métier immédiate)** :
-  * *Altitude & Coordonnées (Latitude/Longitude)* : Déjà connues et statiques pour une ville donnée, les dupliquer dans chaque ligne de mesure de la table cible surchargerait inutilement le stockage.
-  * *Interval (900s)* : Fréquence de rafraîchissement technique de l'API Open-Meteo, sans valeur métier pour les rapports.
-  * *Unités (ex: `°C`, `%`)* : Statiques, elles doivent être définies dans la documentation de la table ou le type de colonne de la base de données, pas dans chaque enregistrement.
-  * *Temps de génération de la requête (`generationtime_ms`)* : Métrique de performance technique propre à l'API Open-Meteo, sans intérêt pour le suivi de la météo.
-
-### C. Cohérence avec la future table cible SQL
-La structure produite par le schéma Pydantic `WeatherData` correspond parfaitement aux types de colonnes d'une table SQL relationnelle standard :
 ```sql
-CREATE TABLE weather_measures (
+-- 1. Table de stockage des données de mesures météo (Propres et validées)
+CREATE TABLE IF NOT EXISTS weather_measures (
     id SERIAL PRIMARY KEY,
     city VARCHAR(50) NOT NULL,
     temperature NUMERIC(4, 2) NOT NULL,
     conditions VARCHAR(100) NOT NULL,
-    humidity INT CHECK (humidity >= 0 AND humidity <= 100) NOT NULL,
-    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+    humidity INT NOT NULL,
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL
+);
+
+-- 2. Table d'audit/suivi d'ingestion des exécutions du DAG
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    id SERIAL PRIMARY KEY,
+    run_id VARCHAR(100) NOT NULL,
+    execution_date TIMESTAMP WITH TIME ZONE NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    cities_processed VARCHAR(255) NOT NULL,
+    records_inserted INT NOT NULL,
+    inserted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 ```
 
 ---
 
-## 3. Preuve d'exécution (Logs réels)
+## 3. Paramétrage dynamique (Airflow Params)
 
-L'exécution du DAG a été réalisée avec succès en local via la commande `airflow dags test`. Voici l'extrait pertinent des logs montrant le traitement et la consolidation finale :
-
-### Tâche finale d'agrégation (`save_weather_report`)
-```text
-Task instance is in running state
-Current task name:save_weather_report
-Dag name:tp2_simple_dag
-
-Début de l'agrégation des rapports météo...
---- RAPPORT MÉTÉO CONSOLIDÉ (3 VILLES) ---
-[Paris] Température: 14.8°C | Humidité: 64% | Conditions: Mainly clear | Enregistré à (UTC): 2026-06-09 07:57:25.485210+00:00
-[Lyon] Température: 17.3°C | Humidité: 69% | Conditions: Drizzle: Light | Enregistré à (UTC): 2026-06-09 07:57:24.763871+00:00
-[Marseille] Température: 23.5°C | Humidité: 62% | Conditions: Clear sky | Enregistré à (UTC): 2026-06-09 07:57:26.187394+00:00
--------------------------------------------------------
-
-Task instance in success state
-Dag run in success state
-DagRun Finished: state=success, run_duration=5.683649
-```
+Le DAG est paramétrable lors du déclenchement manuel :
+* **Paramètre `cities`** : Liste de chaînes de caractères (clés des villes à traiter). Par défaut : `["paris", "lyon", "marseille"]`.
+* **Mécanisme d'exclusion** : Si une ville est retirée de cette liste, la tâche d'extraction correspondante lève une exception `AirflowSkipException`. Airflow propage alors l'état *SKIPPED* sur toute sa branche (les tâches de validation et de chargement associées sont aussi sautées), évitant tout appel API ou écriture SQL inutile.
 
 ---
 
-## 4. Captures d'écran de l'exécution
+## 4. Preuve de chargement (SELECT SQL)
+
+Pour valider le pipeline, nous avons effectué **trois exécutions de test** successives :
+1. **Run 1 (Ligne de commande - Complet)** : Déclenchement par défaut (toutes les 3 villes sont traitées : Paris, Lyon, Marseille).
+2. **Run 2 (Ligne de commande - Filtré)** : Déclenchement paramétré pour exclure Lyon (seules Paris et Marseille sont traitées).
+3. **Run 3 (Interface Standalone Airflow - Complet)** : Déclenchement via l'interface web standalone d'Airflow (Paris, Lyon, Marseille).
+
+Voici le contenu final extrait des tables PostgreSQL par requêtes `SELECT` après ces exécutions :
+
+### Table des mesures météo (`weather_measures`)
+```text
+WEATHER MEASURES:
+(1, 'Marseille', Decimal('22.70'), 'Clear sky', 61, datetime.datetime(2026, 6, 9, 12, 46, 30, 227288, tzinfo=datetime.timezone.utc))
+(2, 'Lyon', Decimal('20.70'), 'Overcast', 52, datetime.datetime(2026, 6, 9, 12, 46, 31, 606885, tzinfo=datetime.timezone.utc))
+(3, 'Paris', Decimal('19.00'), 'Mainly clear', 40, datetime.datetime(2026, 6, 9, 12, 46, 30, 889907, tzinfo=datetime.timezone.utc))
+(4, 'Marseille', Decimal('22.70'), 'Clear sky', 61, datetime.datetime(2026, 6, 9, 12, 46, 53, 565407, tzinfo=datetime.timezone.utc))
+(5, 'Paris', Decimal('19.00'), 'Mainly clear', 40, datetime.datetime(2026, 6, 9, 12, 46, 52, 742466, tzinfo=datetime.timezone.utc))
+(6, 'Marseille', Decimal('22.70'), 'Clear sky', 61, datetime.datetime(2026, 6, 9, 12, 51, 15, 452352, tzinfo=datetime.timezone.utc))
+(7, 'Lyon', Decimal('20.70'), 'Overcast', 52, datetime.datetime(2026, 6, 9, 12, 51, 16, 598131, tzinfo=datetime.timezone.utc))
+(8, 'Paris', Decimal('19.00'), 'Mainly clear', 40, datetime.datetime(2026, 6, 9, 12, 51, 16, 597237, tzinfo=datetime.timezone.utc))
+```
+*Analyse : Les Runs 1 (IDs 1, 2, 3) et 3 (IDs 6, 7, 8) ont inséré toutes les 3 villes. Le Run 2 (IDs 4, 5) a correctement sauté Lyon.*
+
+### Table de suivi d'ingestion (`ingestion_runs`)
+```text
+INGESTION RUNS:
+(1, 'manual__2026-06-09T12:46:26.713881+00:00', datetime.datetime(2026, 6, 9, 12, 46, 26, 632211, tzinfo=datetime.timezone.utc), 'SUCCESS', 'Paris, Lyon, Marseille', 3, datetime.datetime(2026, 6, 9, 12, 46, 34, 736324, tzinfo=datetime.timezone.utc))
+(2, 'manual__2026-06-09T12:46:49.190195+00:00', datetime.datetime(2026, 6, 9, 12, 46, 49, 118191, tzinfo=datetime.timezone.utc), 'SUCCESS', 'Paris, Marseille', 2, datetime.datetime(2026, 6, 9, 12, 46, 55, 712238, tzinfo=datetime.timezone.utc))
+(3, 'manual__2026-06-09T12:51:10.775497+00:00', datetime.datetime(2026, 6, 9, 12, 51, 18, 608476, tzinfo=datetime.timezone.utc), 'SUCCESS', 'Paris, Lyon, Marseille', 3, datetime.datetime(2026, 6, 9, 12, 51, 18, 637679, tzinfo=datetime.timezone.utc))
+```
+*Analyse : L'audit montre les métadonnées pour chaque exécution. Le troisième run a bien été enregistré avec succès pour 3 villes.*
+
+---
+
+## 5. Captures d'écran de l'exécution
 
 ### Preuve d'exécution globale dans l'interface Airflow (3 branches en parallèle)
-![Preuve d'exécution globale](assets/preuve_execution_2A.png)
+![Preuve d'exécution globale](assets/preuve_execution_2B.png)
 
-### Rapport et logs de la tâche de sauvegarde consolidée (save_weather_report)
-![Rapport et logs](assets/save_weather_screen_2A.png)
+### Rapport et logs de la tâche de chargement PostgreSQL (load_weather_[ville])
+![Rapport et logs](assets/load_weather_screen_2B.png)
