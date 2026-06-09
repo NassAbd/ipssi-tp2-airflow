@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import json
 import requests
 from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.sdk import Param  # type: ignore
 from airflow.sdk.exceptions import AirflowSkipException
 from schemas import WeatherData
@@ -25,8 +27,8 @@ CITIES = {
     "marseille": {"lat": 43.2965, "lon": 5.3698, "display_name": "Marseille"},
 }
 
-def extract_weather_data(city_key: str, lat: float, lon: float, city: str, **kwargs: Any) -> dict:
-    """Tâche d'extraction brute : appelle l'API Open-Meteo pour récupérer le JSON brut d'une ville."""
+def extract_weather_data(city_key: str, lat: float, lon: float, city: str, **kwargs: Any) -> str:
+    """Tâche d'extraction brute : appelle l'API Open-Meteo et stocke le JSON brut sur MinIO."""
     # Récupération des paramètres d'exécution
     params = kwargs.get('params', {})
     cities_to_process = params.get('cities', [])
@@ -46,18 +48,65 @@ def extract_weather_data(city_key: str, lat: float, lon: float, city: str, **kwa
         print(f"Erreur lors de l'appel API pour la ville {city} : {e}")
         raise
         
-    print(f"Données brutes récupérées avec succès pour {city}.")
-    return raw_json
+    print(f"Données brutes récupérées avec succès pour {city}. Archivage sur MinIO...")
+    
+    # Détermination de la date logique pour partitionner le stockage brut
+    dag_run = kwargs.get('dag_run')
+    logical_date = kwargs.get('logical_date')
+    if not logical_date and dag_run:
+        logical_date = dag_run.logical_date
+    if not logical_date:
+        logical_date = datetime.now(timezone.utc)
+        
+    year = logical_date.strftime('%Y')
+    month = logical_date.strftime('%m')
+    day = logical_date.strftime('%d')
+    
+    s3_hook = S3Hook(aws_conn_id="minio_conn")
+    bucket_name = "weather-raw"
+    
+    # Création du bucket si absent (gère les accès concurrents lors d'exécutions parallèles)
+    try:
+        if not s3_hook.check_for_bucket(bucket_name):
+            s3_hook.create_bucket(bucket_name)
+    except Exception as e:
+        if "BucketAlreadyOwnedByYou" in str(e) or "BucketAlreadyExists" in str(e):
+            print(f"Le bucket {bucket_name} existe déjà (création en cours/parallèle par un autre worker).")
+        else:
+            raise
+        
+    object_key = f"raw/year={year}/month={month}/day={day}/{city_key}_raw.json"
+    
+    s3_hook.load_string(
+        string_data=json.dumps(raw_json),
+        key=object_key,
+        bucket_name=bucket_name,
+        replace=True
+    )
+    
+    print(f"Données brutes stockées avec succès dans MinIO à la clé : {object_key}")
+    return object_key
 
 def validate_weather_data(city_key: str, display_name: str, **kwargs: Any) -> dict:
-    """Tâche de transformation/validation : filtre, valide et structure les données via Pydantic."""
+    """Tâche de transformation/validation : lit depuis MinIO, valide et structure les données via Pydantic."""
     print(f"Début de la validation et transformation pour {display_name}...")
     ti = kwargs['ti']
     
-    # Récupération des données brutes de la tâche d'extraction associée via XCom
-    raw_data = ti.xcom_pull(task_ids=f"extract_weather_{city_key}")
-    if not raw_data:
-        raise ValueError(f"Aucune donnée brute récupérée pour {display_name}")
+    # Récupération de la clé d'objet MinIO stockée par extract_weather
+    object_key = ti.xcom_pull(task_ids=f"extract_weather_{city_key}")
+    if not object_key:
+        raise ValueError(f"Aucune clé de fichier brut MinIO trouvée pour {display_name}")
+        
+    # Lecture depuis MinIO
+    s3_hook = S3Hook(aws_conn_id="minio_conn")
+    bucket_name = "weather-raw"
+    
+    try:
+        raw_data_str = s3_hook.read_key(key=object_key, bucket_name=bucket_name)
+        raw_data = json.loads(raw_data_str)
+    except Exception as e:
+        print(f"Erreur de lecture depuis MinIO pour {object_key} : {e}")
+        raise
         
     current = raw_data.get("current", {})
     temp = current.get("temperature_2m")
