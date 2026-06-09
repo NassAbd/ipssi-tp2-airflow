@@ -10,7 +10,7 @@ wheels/
 .venv
 
 # Airflow local runtime files
-airflow.db
+airflow.db*
 airflow.cfg
 logs/
 *.log

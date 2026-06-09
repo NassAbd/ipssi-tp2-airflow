@@ -1,6 +1,5 @@
 import os
 import sys
-import pytest
 
 # S'assurer que le dossier dags est dans le path python pour l'importation
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../dags')))
@@ -8,8 +7,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../dags
 from airflow.models import DagBag
 
 def test_dag_loading():
-    """Vérifie que le DAG s'importe correctement sans erreur."""
-    # On désactive la vérification stricte du dossier d'exécution pour DagBag
+    """Vérifie que le DAG s'importe correctement sans erreur et possède la structure TP2A."""
     dagbag = DagBag(dag_folder=os.path.abspath(os.path.join(os.path.dirname(__file__), '../dags')), include_examples=False)
     
     # Vérification des erreurs d'import
@@ -21,18 +19,32 @@ def test_dag_loading():
     
     dag = dagbag.dags[dag_id]
     
-    # Vérification qu'il y a exactement 3 tâches
-    assert len(dag.tasks) == 3, f"Le DAG doit avoir exactement 3 tâches, trouvé {len(dag.tasks)}"
+    # Pour 3 villes (paris, lyon, marseille) : 3 extractions + 3 validations + 1 sauvegarde = 7 tâches
+    assert len(dag.tasks) == 7, f"Le DAG doit avoir exactement 7 tâches pour le multi-villes, trouvé {len(dag.tasks)}"
     
-    # Vérification des IDs de tâches
+    # Vérification des IDs de tâches attendus
+    expected_task_ids = [
+        "extract_weather_paris",
+        "extract_weather_lyon",
+        "extract_weather_marseille",
+        "validate_weather_paris",
+        "validate_weather_lyon",
+        "validate_weather_marseille",
+        "save_weather_report"
+    ]
     task_ids = [task.task_id for task in dag.tasks]
-    expected_task_ids = ["extract_weather_data", "validate_weather_data", "save_weather_report"]
     assert sorted(task_ids) == sorted(expected_task_ids), f"Tâches attendues {expected_task_ids}, trouvées {task_ids}"
     
-    # Vérification des dépendances : extract_weather_data >> validate_weather_data >> save_weather_report
-    extract_task = dag.get_task("extract_weather_data")
-    validate_task = dag.get_task("validate_weather_data")
+    # Vérification des liens de dépendances par ville
+    villes = ["paris", "lyon", "marseille"]
     save_task = dag.get_task("save_weather_report")
     
-    assert validate_task.task_id in [t.task_id for t in extract_task.downstream_list], "validate_weather_data doit être en aval de extract_weather_data"
-    assert save_task.task_id in [t.task_id for t in validate_task.downstream_list], "save_weather_report doit être en aval de validate_weather_data"
+    for ville in villes:
+        extract_task = dag.get_task(f"extract_weather_{ville}")
+        validate_task = dag.get_task(f"validate_weather_{ville}")
+        
+        # extract_weather_[ville] >> validate_weather_[ville]
+        assert validate_task.task_id in [t.task_id for t in extract_task.downstream_list], f"validate_weather_{ville} doit être en aval de extract_weather_{ville}"
+        
+        # validate_weather_[ville] >> save_weather_report
+        assert save_task.task_id in [t.task_id for t in validate_task.downstream_list], f"save_weather_report doit être en aval de validate_weather_{ville}"
